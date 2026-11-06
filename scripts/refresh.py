@@ -2,7 +2,7 @@
 Downloads Scryfall's card data and Commander Spellbook's combos, trims them to what the site uses,
 and rewrites cards.json, aliases.json, combos.json and meta.json. If a source fails, the old file is kept
 (and combos are re-linked to the new card list by name, so they never point at the wrong card)."""
-import json, sys, os, datetime, urllib.request, ijson
+import json, sys, os, datetime, gzip, io, urllib.request, ijson
 
 UA = {"User-Agent": "dvl-deck-refresh/1.0", "Accept": "application/json"}
 FMT = ["standard", "pioneer", "modern", "legacy", "vintage", "commander", "pauper", "brawl"]
@@ -11,18 +11,31 @@ SKIP_LAYOUT = {"token", "double_faced_token", "emblem", "art_series", "planar", 
 def get(url):
     return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=600)
 
-def bulk_uri(kind):
+def bulk_items(kind):
+    """Yield every card object from one of Scryfall's bulk files (JSON Lines or classic JSON array)."""
     meta = json.load(get("https://api.scryfall.com/bulk-data"))
     items = meta.get("data", meta if isinstance(meta, list) else [])
-    b = next((x for x in items if x.get("type") == kind or x.get("bulk_type") == kind), None)
+    b = next((x for x in items if x.get("type") == kind), None)
     if b is None: raise RuntimeError(f"no bulk entry '{kind}'; saw {[x.get('type') for x in items]}")
-    for k in ("download_uri", "download_url", "uri_download", "file_uri"):
-        if b.get(k): return b[k]
-    if b.get("uri"):  # the per-file object sometimes carries the link
-        d = json.load(get(b["uri"]))
-        for k in ("download_uri", "download_url", "file_uri"):
-            if d.get(k): return d[k]
-    raise RuntimeError(f"bulk entry '{kind}' has no download link; keys: {sorted(b.keys())}")
+    if not (b.get("jsonl_download_uri") or b.get("download_uri")) and b.get("uri"): b = {**b, **json.load(get(b["uri"]))}
+    url, lines = (b["jsonl_download_uri"], True) if b.get("jsonl_download_uri") else (b.get("download_uri"), False)
+    if not url: raise RuntimeError(f"bulk entry '{kind}' has no download link; keys: {sorted(b.keys())}")
+    raw = get(url); head = raw.read(2); stream = io.BufferedReader(_Prefixed(head, raw))
+    if head == b"\x1f\x8b": stream = gzip.GzipFile(fileobj=stream)
+    if lines:
+        for ln in io.TextIOWrapper(stream, encoding="utf-8"):
+            ln = ln.strip().rstrip(",")
+            if ln and ln not in ("[", "]"): yield json.loads(ln)
+    else:
+        yield from ijson.items(stream, "item", use_float=True)
+
+class _Prefixed(io.RawIOBase):
+    def __init__(self, head, rest): self.head, self.rest = head, rest
+    def readable(self): return True
+    def readinto(self, b):
+        if self.head:
+            n = min(len(b), len(self.head)); b[:n] = self.head[:n]; self.head = self.head[n:]; return n
+        data = self.rest.read(len(b)); n = len(data); b[:n] = data; return n
 
 def trim_card(c):
     if c.get("layout") in SKIP_LAYOUT: return None
@@ -49,7 +62,7 @@ def trim_card(c):
 
 def build_cards():
     out = []
-    for c in ijson.items(get(bulk_uri("oracle_cards")), "item", use_float=True):
+    for c in bulk_items("oracle_cards"):
         r = trim_card(c)
         if r: out.append(r)
     out.sort(key=lambda r: (r[13] == 0, r[13], r[0]))
@@ -58,7 +71,7 @@ def build_cards():
 
 def build_aliases(names):
     al = {}
-    for c in ijson.items(get(bulk_uri("default_cards")), "item"):
+    for c in bulk_items("default_cards"):
         fn = c.get("flavor_name") or (c.get("card_faces") or [{}])[0].get("flavor_name")
         if fn and c.get("name") in names and fn.lower() not in names: al[fn] = c["name"]
     if len(al) < 100: raise RuntimeError("too few aliases")
