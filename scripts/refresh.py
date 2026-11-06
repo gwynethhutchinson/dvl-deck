@@ -13,7 +13,16 @@ def get(url):
 
 def bulk_uri(kind):
     meta = json.load(get("https://api.scryfall.com/bulk-data"))
-    return next(b["download_uri"] for b in meta["data"] if b["type"] == kind)
+    items = meta.get("data", meta if isinstance(meta, list) else [])
+    b = next((x for x in items if x.get("type") == kind or x.get("bulk_type") == kind), None)
+    if b is None: raise RuntimeError(f"no bulk entry '{kind}'; saw {[x.get('type') for x in items]}")
+    for k in ("download_uri", "download_url", "uri_download", "file_uri"):
+        if b.get(k): return b[k]
+    if b.get("uri"):  # the per-file object sometimes carries the link
+        d = json.load(get(b["uri"]))
+        for k in ("download_uri", "download_url", "file_uri"):
+            if d.get(k): return d[k]
+    raise RuntimeError(f"bulk entry '{kind}' has no download link; keys: {sorted(b.keys())}")
 
 def trim_card(c):
     if c.get("layout") in SKIP_LAYOUT: return None
